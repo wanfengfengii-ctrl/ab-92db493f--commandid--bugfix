@@ -259,12 +259,23 @@ pytest
 
 ## Docker Compose
 
-Compose 只运行 API 一个常驻服务；宿主端口由环境变量 `API_PORT` 覆盖（默认 8000）：
+Compose 只运行 API 一个常驻服务；宿主端口由环境变量 `API_PORT` 覆盖（默认 8000），
+工作进程数由环境变量 `API_WORKERS` 覆盖（默认 1，可配置为 >1）：
 
 ```bash
 API_PORT=9000 docker compose up --build api
 # 服务监听在宿主的 9000 端口
+
+API_WORKERS=2 docker compose up --build api
+# 两个工作进程共享同一个 SQLite 持久化卷
 ```
+
+`API_WORKERS` 设为大于 1 时，多个工作进程只共享同一个 SQLite 文件、不共享任何
+进程内状态：判重、版本检查与写入在每次请求的 `BEGIN IMMEDIATE` 写事务内一次原子
+完成，`commands.commandId` 主键是跨进程仲裁点。因此同一 commandId 的并发请求无论
+落到哪个进程，都只有一次提交，其余全部重放首次成功的状态码与响应字节（或在内容
+不一致时稳定返回 409）；进程切换与容器重建后从磁盘完整恢复，语义不变。
+
 
 一次性验收服务 `verify`：等待 API 健康后，先跑完整 pytest 判据，再对运行中的
 API 做 HTTP 级验收（三种结论、排列字节级一致、各类错误代码），随后退出：
@@ -288,6 +299,7 @@ tests/
   test_rules.py    # 全部配对、优先级、依据排序、移除分析与排列不变性
   test_api.py      # assess / removal-impact 的 HTTP 行为与字节级一致
   test_reviews.py  # 草稿/命令/确认、判重重放、冲突重试与并发原子性
+  test_store_multiprocess.py  # 多工作进程拓扑下的判重仲裁、原子重放与重建恢复
 verify/
   acceptance.py  # 对运行中实例的一次性 HTTP 验收
 Dockerfile

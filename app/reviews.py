@@ -10,13 +10,19 @@
   响应（字节一致），同标识不同内容返回 ``COMMAND_ID_REUSED``；失败命令
   （404/409/400）不写入任何索引，因而冲突命令可用同一 commandId 携带新的
   ``expectedRevision`` 重试；
-- 判重检查、状态检查与写入在同一把进程内锁内一次完成，争用同一版本的
-  多个命令只有一个原子成功，其余得到 409 且不留下部分状态。
+- 判重检查、状态检查与写入在同一个 ``BEGIN IMMEDIATE`` 事务中完成。
 
-审核、版本快照、确认状态与成功命令的判重记录都写入 SQLite（标准库，
-无外部依赖）：每次成功的状态变更与命令记录在同一个 ``BEGIN IMMEDIATE``
-事务中提交，进程重启后从磁盘完整恢复，判重与重放语义不变。数据库路径由
-环境变量 ``STOWAGE_DB_PATH`` 指定；缺省（如本地测试）为 ``:memory:``。
+多工作进程部署（``uvicorn --workers N``）下，每个进程都持有指向同一个
+SQLite 文件的连接；进程内用一把锁串行化对连接的使用，进程间由 SQLite
+的写锁互斥。关键在于**不缓存**判重/版本状态：命令判重、审核与版本的
+读取全部发生在取得写锁之后的事务内（read-your-writes），因此并发落到
+不同工作进程的同标识请求只会有一个插入成功，其余事务在唯一约束上失败
+后重新打开事务、读取获胜者写入的记录并原样重放；争用同一版本的不同
+命令同样只有一个原子成功。数据库以 WAL 模式打开，提交即落盘，容器
+重建后从文件完整恢复，判重与重放语义不变。
+
+数据库路径由环境变量 ``STOWAGE_DB_PATH`` 指定；缺省（如本地测试）为
+``:memory:``（单进程内存库）。
 """
 
 from __future__ import annotations
@@ -27,7 +33,7 @@ import os
 import sqlite3
 import threading
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 
 from app.rules import assess
 from app.validation import ACTION_CONFIRM, ACTION_REPLACE_ITEMS, ApiError
@@ -38,6 +44,10 @@ CONFIRMED = "CONFIRMED"
 # 持久化数据库路径环境变量；未配置时退化为进程内内存库（测试用）。
 DB_PATH_ENV = "STOWAGE_DB_PATH"
 DEFAULT_DB_PATH = ":memory:"
+
+# 唯一约束冲突（理论上只会在跨进程同 commandId 竞争时出现一次）后，
+# 重新打开事务重读获胜记录的最大次数。
+MAX_COMMIT_RETRIES = 10
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS reviews (
@@ -78,7 +88,7 @@ def _jsonable(value: object) -> object:
 
 
 def _canonical_key(canonical: tuple) -> str:
-    """规范化内容的稳定序列化形式，用于跨重启的判重比较。"""
+    """规范化内容的稳定序列化形式，用于跨进程/重启的判重比较。"""
     return json.dumps(
         _jsonable(canonical),
         ensure_ascii=False,
@@ -94,73 +104,49 @@ def _render_body(content: dict) -> bytes:
     ).encode("utf-8")
 
 
-class _Revision:
-    """某一版本的规范化请求与裁决快照。"""
-
-    def __init__(
-        self,
-        revision: int,
-        hold: str,
-        items: tuple[tuple[str, str], ...],
-        command_id: str,
-        action: str,
-        verdict: dict | None = None,
-    ) -> None:
-        self.revision = revision
-        self.hold = hold
-        self.items = items
-        self.command_id = command_id
-        self.action = action
-        # 重启恢复时裁决按冻结快照原样载入；新快照复用规则引擎计算。
-        self.verdict = verdict if verdict is not None else assess(list(items))
+def _items_json(items: tuple[tuple[str, str], ...]) -> str:
+    return json.dumps([[item_id, category] for item_id, category in items],
+                      ensure_ascii=False)
 
 
-class _Review:
-    def __init__(
-        self,
-        review_id: str,
-        hold: str,
-        status: str,
-        revisions: list[_Revision],
-    ) -> None:
-        self.review_id = review_id
-        self.hold = hold
-        self.status = status
-        self.revisions: list[_Revision] = revisions
-
-    @classmethod
-    def new_draft(
-        cls,
-        review_id: str,
-        hold: str,
-        items: tuple[tuple[str, str], ...],
-        command_id: str,
-    ) -> "_Review":
-        return cls(review_id, hold, DRAFT, [_Revision(1, hold, items, command_id, "CREATE")])
-
-    @property
-    def revision(self) -> int:
-        return self.revisions[-1].revision
-
-    @property
-    def current(self) -> _Revision:
-        return self.revisions[-1]
+def _load_items(items_json: str) -> tuple[tuple[str, str], ...]:
+    return tuple((entry[0], entry[1]) for entry in json.loads(items_json))
 
 
-class _CommandRecord:
-    """一次成功命令的判重记录：规范化内容键 + 首次响应字节。"""
-
-    def __init__(
-        self, canonical_key: str, review_id: str, status_code: int, body: bytes
-    ) -> None:
-        self.canonical_key = canonical_key
-        self.review_id = review_id
-        self.status_code = status_code
-        self.body = body
+def _review_body(
+    review_id: str,
+    revision: int,
+    status: str,
+    command_id: str,
+    hold: str,
+    items: tuple[tuple[str, str], ...],
+    verdict: dict,
+) -> bytes:
+    """构造审核响应体并渲染为字节（与 JSONResponse 设置一致）。"""
+    return _render_body(
+        {
+            "reviewId": review_id,
+            "revision": revision,
+            "status": status,
+            "commandId": command_id,
+            "hold": hold,
+            "items": [
+                {"id": item_id, "category": category}
+                for item_id, category in items
+            ],
+            "conclusion": verdict["conclusion"],
+            "evidence": verdict["evidence"],
+        }
+    )
 
 
 class ReviewStore:
-    """线程安全、可持久化的审核存储；所有公开方法均为原子操作。"""
+    """线程安全、可持久化、支持多工作进程共享同一文件的审核存储。
+
+    所有公开方法都是原子操作：进程内由 :attr:`_lock` 串行化对单个 SQLite
+    连接的使用，进程间由 ``BEGIN IMMEDIATE`` 取得的写锁互斥；判重与状态
+    读取均在写事务内完成，唯一约束是跨进程判重的最终防线。
+    """
 
     def __init__(self, db_path: str | None = None) -> None:
         path = (
@@ -171,145 +157,94 @@ class ReviewStore:
         if path != DEFAULT_DB_PATH:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self._db_path = path
-        self._lock = threading.RLock()
-        self._reviews: dict[str, _Review] = {}
-        self._commands: dict[str, _CommandRecord] = {}
-        # 单进程 uvicorn 部署：进程内 RLock 串行化，SQLite 事务负责落盘与
-        # 原子可见性；isolation_level=None 以便显式控制 BEGIN/COMMIT。
-        self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        # 进程内锁：sqlite3 连接被多线程共享，必须保证 BEGIN/COMMIT 不被
+        # 同进程的其他线程穿插；跨进程互斥由 SQLite 写锁负责。
+        self._lock = threading.Lock()
+        # isolation_level=None：自行控制 BEGIN IMMEDIATE/COMMIT；timeout 与
+        # busy_timeout 让写锁争用等待而非立即报错。
+        self._db = sqlite3.connect(
+            path, check_same_thread=False, isolation_level=None, timeout=5.0
+        )
+        self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA busy_timeout=5000")
+        if path != DEFAULT_DB_PATH:
+            # WAL：多个工作进程可同时持有读锁、单写者不阻塞读取；
+            # NORMAL 在 WAL 下对进程崩溃/容器重建安全（提交已进入 WAL）。
+            self._db.execute("PRAGMA journal_mode=WAL")
+            self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.executescript(_SCHEMA)
-        self._load()
 
-    # ---- 持久化 ---------------------------------------------------------
+    def close(self) -> None:
+        with self._lock:
+            self._db.close()
 
-    @contextlib.contextmanager
-    def _transaction(self) -> Iterator[None]:
-        # IMMEDIATE 立即取得写锁：判重检查与写入在同一事务内，进程内锁之外
-        # 也不会有任何写入穿插，保证“仅一个原子成功”且提交即落盘。
-        self._db.execute("BEGIN IMMEDIATE")
-        try:
-            yield
-            self._db.execute("COMMIT")
-        except BaseException:
-            self._db.execute("ROLLBACK")
-            raise
+    # ---- 事务基元 -------------------------------------------------------
 
-    def _load(self) -> None:
-        """启动时从磁盘恢复全部审核快照与成功命令判重记录。"""
-        revisions_by_review: dict[str, list[_Revision]] = {}
-        rows = self._db.execute(
-            "SELECT review_id, revision, hold, items_json, command_id, action, "
-            "verdict_json FROM revisions ORDER BY review_id, revision"
-        ).fetchall()
-        for (
-            review_id,
-            revision,
-            hold,
-            items_json,
-            command_id,
-            action,
-            verdict_json,
-        ) in rows:
-            items = tuple(
-                (entry[0], entry[1]) for entry in json.loads(items_json)
-            )
-            verdict = json.loads(verdict_json)
-            revisions_by_review.setdefault(review_id, []).append(
-                _Revision(revision, hold, items, command_id, action, verdict)
-            )
+    def _transact(
+        self, mutate: Callable[[sqlite3.Connection], tuple[int, bytes]]
+    ) -> tuple[int, bytes]:
+        """在进程锁内运行一次 ``BEGIN IMMEDIATE`` 写事务。
 
-        for review_id, hold, status in self._db.execute(
-            "SELECT review_id, hold, status FROM reviews"
-        ).fetchall():
-            self._reviews[review_id] = _Review(
-                review_id, hold, status, revisions_by_review.get(review_id, [])
-            )
+        ``mutate`` 必须在事务内先做判重与状态读取、再写入，并返回
+        ``(状态码, 响应字节)``；它抛出的 :class:`ApiError` 会原样上抛
+        （已回滚，不重试——失败命令不占标识）。遇到跨进程竞争导致的
+        ``IntegrityError``（唯一约束）或锁/提交相关 ``OperationalError``
+        则回滚并整段重跑，重新读取获胜者已提交的记录；保证连接不会
+        停留在未结束的事务中。
+        """
+        last_error: sqlite3.Error | None = None
+        for _ in range(MAX_COMMIT_RETRIES):
+            with self._lock:
+                try:
+                    self._db.execute("BEGIN IMMEDIATE")
+                except sqlite3.OperationalError as exc:
+                    # 写锁等待 busy_timeout 后仍未取得：尚未开启事务，重试。
+                    last_error = exc
+                    continue
 
-        for command_id, canonical_json, review_id, status_code, body in self._db.execute(
+                committed = False
+                try:
+                    result = mutate(self._db)
+                    self._db.execute("COMMIT")
+                    committed = True
+                    return result
+                except ApiError:
+                    raise
+                except (sqlite3.IntegrityError, sqlite3.OperationalError) as exc:
+                    # IntegrityError：另一工作进程抢先提交了同 commandId；
+                    # OperationalError：提交/读写阶段的锁等瞬时错误。
+                    # 回滚后整段重跑，mutate 会读到最新已提交状态。
+                    last_error = exc
+                    continue
+                finally:
+                    if not committed:
+                        with contextlib.suppress(sqlite3.Error):
+                            self._db.execute("ROLLBACK")
+        assert last_error is not None
+        raise last_error
+
+    @staticmethod
+    def _existing_command(
+        db: sqlite3.Connection, command_id: str
+    ) -> sqlite3.Row | None:
+        """必须在写事务内调用：读到的一定是已提交的最新命令记录。"""
+        return db.execute(
             "SELECT command_id, canonical_json, review_id, status_code, body "
-            "FROM commands"
-        ).fetchall():
-            self._commands[command_id] = _CommandRecord(
-                canonical_json, review_id, status_code, bytes(body)
-            )
+            "FROM commands WHERE command_id = ?",
+            (command_id,),
+        ).fetchone()
 
     @staticmethod
-    def _revision_params(review_id: str, revision: _Revision) -> tuple:
-        items_json = json.dumps(
-            [list(item) for item in revision.items], ensure_ascii=False
-        )
-        verdict_json = json.dumps(revision.verdict, ensure_ascii=False)
-        return (
-            review_id,
-            revision.revision,
-            revision.hold,
-            items_json,
-            revision.command_id,
-            revision.action,
-            verdict_json,
-        )
-
-    def _persist_success(
-        self,
-        command_id: str,
-        canonical_key: str,
-        review: _Review,
-        status_code: int,
-        body: bytes,
-        db_writes: Callable[[], None],
-    ) -> None:
-        """状态变更与命令记录在同一事务落盘，随后才更新内存索引。"""
-        with self._transaction():
-            db_writes()
-            self._db.execute(
-                "INSERT INTO commands (command_id, canonical_json, review_id, "
-                "status_code, body) VALUES (?, ?, ?, ?, ?)",
-                (command_id, canonical_key, review.review_id, status_code, body),
-            )
-        self._commands[command_id] = _CommandRecord(
-            canonical_key, review.review_id, status_code, body
-        )
-
-    # ---- 响应渲染 -------------------------------------------------------
-
-    @staticmethod
-    def _body_for(
-        review: _Review,
-        command_id: str,
-        revision: _Revision | None = None,
-        status: str | None = None,
-    ) -> dict:
-        current = revision if revision is not None else review.current
-        return {
-            "reviewId": review.review_id,
-            "revision": current.revision,
-            "status": status if status is not None else review.status,
-            "commandId": command_id,
-            "hold": current.hold,
-            "items": [
-                {"id": item_id, "category": category}
-                for item_id, category in current.items
-            ],
-            "conclusion": current.verdict["conclusion"],
-            "evidence": current.verdict["evidence"],
-        }
-
-    def _replay_or_reject(
-        self, command_id: str, canonical_key: str
-    ) -> tuple[int, bytes] | None:
-        """全局判重：命中且内容一致则重放，内容不一致则 409。"""
-        existing = self._commands.get(command_id)
-        if existing is None:
-            return None
-        if existing.canonical_key != canonical_key:
+    def _replay_existing(existing: sqlite3.Row, canonical_key: str) -> tuple[int, bytes]:
+        """命中判重：内容一致原样重放，不一致 → 409 COMMAND_ID_REUSED。"""
+        if existing["canonical_json"] != canonical_key:
             raise ApiError(
                 "COMMAND_ID_REUSED",
-                f"Command id '{command_id}' was already used with a "
+                f"Command id '{existing['command_id']}' was already used with a "
                 "different request.",
                 status=409,
             )
-        return existing.status_code, existing.body
+        return existing["status_code"], bytes(existing["body"])
 
     # ---- 建草稿 ---------------------------------------------------------
 
@@ -318,31 +253,39 @@ class ReviewStore:
     ) -> tuple[int, bytes]:
         canonical_items = _canonical_items(items)
         # CREATE 标记确保同一 commandId 不能跨建草稿与下命令混用。
-        canonical = ("CREATE", hold, canonical_items)
-        canonical_key = _canonical_key(canonical)
-        with self._lock:
-            replay = self._replay_or_reject(command_id, canonical_key)
-            if replay is not None:
-                return replay
+        canonical_key = _canonical_key(("CREATE", hold, canonical_items))
+
+        def mutate(db: sqlite3.Connection) -> tuple[int, bytes]:
+            existing = self._existing_command(db, command_id)
+            if existing is not None:
+                return self._replay_existing(existing, canonical_key)
 
             review_id = uuid.uuid4().hex
-            review = _Review.new_draft(review_id, hold, canonical_items, command_id)
-            body = _render_body(self._body_for(review, command_id))
-
-            def db_writes() -> None:
-                self._db.execute(
-                    "INSERT INTO reviews (review_id, hold, status) VALUES (?, ?, ?)",
-                    (review_id, hold, DRAFT),
-                )
-                self._db.execute(
-                    "INSERT INTO revisions (review_id, revision, hold, items_json, "
-                    "command_id, action, verdict_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    self._revision_params(review_id, review.current),
-                )
-
-            self._persist_success(command_id, canonical_key, review, 201, body, db_writes)
-            self._reviews[review_id] = review
+            verdict = assess(list(canonical_items))
+            body = _review_body(
+                review_id, 1, DRAFT, command_id, hold, canonical_items, verdict
+            )
+            db.execute(
+                "INSERT INTO reviews (review_id, hold, status) VALUES (?, ?, ?)",
+                (review_id, hold, DRAFT),
+            )
+            db.execute(
+                "INSERT INTO revisions (review_id, revision, hold, items_json, "
+                "command_id, action, verdict_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    review_id, 1, hold, _items_json(canonical_items),
+                    command_id, "CREATE",
+                    json.dumps(verdict, ensure_ascii=False),
+                ),
+            )
+            db.execute(
+                "INSERT INTO commands (command_id, canonical_json, review_id, "
+                "status_code, body) VALUES (?, ?, ?, ?, ?)",
+                (command_id, canonical_key, review_id, 201, body),
+            )
             return 201, body
+
+        return self._transact(mutate)
 
     # ---- 下命令 ---------------------------------------------------------
 
@@ -366,28 +309,38 @@ class ReviewStore:
             canonical = ("CONFIRM", review_id, expected_revision)
         canonical_key = _canonical_key(canonical)
 
-        with self._lock:
-            replay = self._replay_or_reject(command_id, canonical_key)
-            if replay is not None:
-                return replay
+        def mutate(db: sqlite3.Connection) -> tuple[int, bytes]:
+            # 判重先于一切状态检查，且在写事务内读最新已提交记录。
+            existing = self._existing_command(db, command_id)
+            if existing is not None:
+                return self._replay_existing(existing, canonical_key)
 
+            review = db.execute(
+                "SELECT hold, status FROM reviews WHERE review_id = ?",
+                (review_id,),
+            ).fetchone()
             # 新命令的固定报错顺序：
             # REVIEW_NOT_FOUND → REVISION_CONFLICT → REVIEW_FINALIZED。
-            review = self._reviews.get(review_id)
             if review is None:
                 raise ApiError(
                     "REVIEW_NOT_FOUND",
                     f"Review '{review_id}' does not exist.",
                     status=404,
                 )
-            if expected_revision != review.revision:
+            current = db.execute(
+                "SELECT revision, hold, items_json, verdict_json "
+                "FROM revisions WHERE review_id = ? "
+                "ORDER BY revision DESC LIMIT 1",
+                (review_id,),
+            ).fetchone()
+            if expected_revision != current["revision"]:
                 raise ApiError(
                     "REVISION_CONFLICT",
                     f"Expected revision {expected_revision} but review "
-                    f"'{review_id}' is at revision {review.revision}.",
+                    f"'{review_id}' is at revision {current['revision']}.",
                     status=409,
                 )
-            if review.status == CONFIRMED:
+            if review["status"] == CONFIRMED:
                 raise ApiError(
                     "REVIEW_FINALIZED",
                     f"Review '{review_id}' is already confirmed and frozen.",
@@ -396,48 +349,45 @@ class ReviewStore:
 
             if action == ACTION_REPLACE_ITEMS:
                 assert items is not None
-                new_revision = _Revision(
-                    review.revision + 1,
-                    review.hold,
-                    _canonical_items(items),
-                    command_id,
-                    ACTION_REPLACE_ITEMS,
+                new_items = _canonical_items(items)
+                new_revision = current["revision"] + 1
+                verdict = assess(list(new_items))
+                body = _review_body(
+                    review_id, new_revision, DRAFT, command_id,
+                    review["hold"], new_items, verdict,
                 )
-                # 先按“下一版本”渲染并落盘，提交成功后才推进内存状态。
-                body = _render_body(
-                    self._body_for(review, command_id, revision=new_revision)
+                db.execute(
+                    "INSERT INTO revisions (review_id, revision, hold, "
+                    "items_json, command_id, action, verdict_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        review_id, new_revision, review["hold"],
+                        _items_json(new_items), command_id,
+                        ACTION_REPLACE_ITEMS,
+                        json.dumps(verdict, ensure_ascii=False),
+                    ),
                 )
-
-                def db_writes() -> None:
-                    self._db.execute(
-                        "INSERT INTO revisions (review_id, revision, hold, "
-                        "items_json, command_id, action, verdict_json) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        self._revision_params(review_id, new_revision),
-                    )
-
-                self._persist_success(
-                    command_id, canonical_key, review, 200, body, db_writes
+            else:
+                # 确认不推进版本号，只冻结当前快照。
+                frozen_items = _load_items(current["items_json"])
+                verdict = json.loads(current["verdict_json"])
+                body = _review_body(
+                    review_id, current["revision"], CONFIRMED, command_id,
+                    current["hold"], frozen_items, verdict,
                 )
-                review.revisions.append(new_revision)
-                return 200, body
-
-            # 确认不推进版本号，只冻结当前快照。
-            body = _render_body(
-                self._body_for(review, command_id, status=CONFIRMED)
-            )
-
-            def db_writes() -> None:
-                self._db.execute(
+                db.execute(
                     "UPDATE reviews SET status = ? WHERE review_id = ?",
                     (CONFIRMED, review_id),
                 )
 
-            self._persist_success(
-                command_id, canonical_key, review, 200, body, db_writes
+            db.execute(
+                "INSERT INTO commands (command_id, canonical_json, review_id, "
+                "status_code, body) VALUES (?, ?, ?, ?, ?)",
+                (command_id, canonical_key, review_id, 200, body),
             )
-            review.status = CONFIRMED
             return 200, body
+
+        return self._transact(mutate)
 
 
 # 进程级单例存储。

@@ -13,6 +13,8 @@ import uvicorn
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.reviews import ReviewStore
+from app.validation import ApiError
 
 client = TestClient(app)
 REVIEWS_URL = "/api/v1/stowage/reviews"
@@ -516,3 +518,202 @@ def test_concurrent_commands_on_same_revision_only_one_commits(live_server):
         )
         assert status == 200
         assert json.loads(raw)["revision"] == 2
+
+
+# ---- 多工作进程共享同一 SQLite 文件（进程级判重与恢复）-------------------
+#
+# 两个 ReviewStore 各持一条指向同一文件的连接，与 uvicorn --workers 2 下两个
+# 工作进程的情形等价（各自的进程内锁互不相关，互斥只能依赖 SQLite 写事务）。
+
+
+def _forbid_items():
+    return [
+        ("C330", "WET"),
+        ("C101", "FLAM"),
+        ("C205", "OXID"),
+    ]
+
+
+@pytest.fixture
+def shared_stores(tmp_path):
+    db_path = str(tmp_path / "stowage.db")
+    stores = [ReviewStore(db_path), ReviewStore(db_path)]
+    try:
+        yield stores
+    finally:
+        for instance in stores:
+            instance.close()
+
+
+def test_duplicate_store_concurrent_create_replays_are_atomic(shared_stores):
+    # 复现缺陷：同一建草稿请求并发重放，落到两条独立连接时仍只能有一次成功
+    # 插入，其余全部重放首次成功的字节（而非 500 UNIQUE 冲突）。
+    n = 48
+    barrier = threading.Barrier(n)
+    outcomes: list[tuple[int, bytes]] = []
+    outcome_lock = threading.Lock()
+
+    def worker(index: int) -> None:
+        barrier.wait()
+        result = shared_stores[index % 2].create_review(
+            "HOLD-3", _forbid_items(), "multi-create"
+        )
+        with outcome_lock:
+            outcomes.append(result)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(outcomes) == n
+    assert {status for status, _ in outcomes} == {201}
+    bodies = {body for _, body in outcomes}
+    assert len(bodies) == 1
+    # 只产生了一个草稿：所有重放指向同一 reviewId。
+    assert len({json.loads(body)["reviewId"] for body in bodies}) == 1
+
+
+def test_duplicate_store_reused_id_with_other_content_is_conflict(shared_stores):
+    status, _ = shared_stores[0].create_review(
+        "HOLD-3", _forbid_items(), "multi-collide"
+    )
+    assert status == 201
+
+    n = 16
+    barrier = threading.Barrier(n)
+    outcomes: list[int] = []
+    outcome_lock = threading.Lock()
+    other_items = [("C101", "GAS"), ("C205", "OXID")]
+
+    def worker(index: int) -> None:
+        barrier.wait()
+        try:
+            shared_stores[index % 2].create_review(
+                "HOLD-3", other_items, "multi-collide"
+            )
+        except ApiError as exc:
+            code = exc.code
+        with outcome_lock:
+            outcomes.append(code)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    # COMMAND_ID_REUSED 经 ApiError(409) 抛出，由 FastAPI 转为 HTTP 409。
+    assert outcomes == ["COMMAND_ID_REUSED"] * n
+
+
+def test_duplicate_store_concurrent_commands_commit_once(shared_stores):
+    status, body = shared_stores[0].create_review(
+        "HOLD-3", _forbid_items(), "multi-cmd-create"
+    )
+    assert status == 201
+    review_id = json.loads(body)["reviewId"]
+
+    n = 16
+    barrier = threading.Barrier(n)
+    outcomes: list[tuple[int, str]] = []
+    outcome_lock = threading.Lock()
+
+    def worker(index: int) -> None:
+        if index == 0:
+            kwargs = dict(action="CONFIRM", expected_revision=1, items=None)
+        else:
+            kwargs = dict(
+                action="REPLACE_ITEMS",
+                expected_revision=1,
+                items=[(f"A{index}", "TOX"), ("B0", "FLAM")],
+            )
+        barrier.wait()
+        try:
+            code, raw = shared_stores[index % 2].apply_command(
+                review_id, f"multi-cmd-{index}", **kwargs
+            )
+            error = ""
+        except ApiError as exc:
+            code = exc.status
+            error = exc.code
+        with outcome_lock:
+            outcomes.append((code, error))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    successes = [result for result in outcomes if result[0] == 200]
+    failures = [result for result in outcomes if result[0] != 200]
+    assert len(successes) == 1
+    assert len(failures) == n - 1
+    assert {code for code, _ in failures} == {409}
+    assert {error for _, error in failures} <= {
+        "REVISION_CONFLICT",
+        "REVIEW_FINALIZED",
+    }
+
+
+def test_shared_file_recovers_across_store_restart(tmp_path):
+    db_path = str(tmp_path / "stowage.db")
+    first = ReviewStore(db_path)
+    status, create_body = first.create_review(
+        "HOLD-3", _forbid_items(), "restart-create"
+    )
+    assert status == 201
+    review_id = json.loads(create_body)["reviewId"]
+
+    status, replace_body = first.apply_command(
+        review_id,
+        "restart-replace",
+        "REPLACE_ITEMS",
+        1,
+        [("B2", "FLAM"), ("A1", "TOX")],
+    )
+    assert status == 200
+    assert json.loads(replace_body)["revision"] == 2
+    status, confirm_body = first.apply_command(
+        review_id, "restart-confirm", "CONFIRM", 2, None
+    )
+    assert status == 200
+    first.close()
+
+    # 模拟容器重建：全新连接重新打开同一持久化文件。
+    restarted = ReviewStore(db_path)
+    try:
+        status, body = restarted.create_review(
+            "HOLD-3", list(reversed(_forbid_items())), "restart-create"
+        )
+        assert status == 201 and body == create_body
+
+        status, body = restarted.apply_command(
+            review_id,
+            "restart-replace",
+            "REPLACE_ITEMS",
+            1,
+            [("A1", "TOX"), ("B2", "FLAM")],
+        )
+        assert status == 200 and body == replace_body
+
+        status, body = restarted.apply_command(
+            review_id, "restart-confirm", "CONFIRM", 2, None
+        )
+        assert status == 200 and body == confirm_body
+
+        # 同标识不同内容仍稳定 409；冻结状态完整恢复。
+        with pytest.raises(ApiError) as reused:
+            restarted.create_review(
+                "HOLD-3", [("C101", "GAS"), ("C205", "OXID")], "restart-create"
+            )
+        assert reused.value.code == "COMMAND_ID_REUSED"
+        with pytest.raises(ApiError) as finalized:
+            restarted.apply_command(
+                review_id, "restart-new", "CONFIRM", 2, None
+            )
+        assert finalized.value.code == "REVIEW_FINALIZED"
+    finally:
+        restarted.close()

@@ -259,12 +259,23 @@ pytest
 
 ## Docker Compose
 
-Compose 只运行 API 一个常驻服务；宿主端口由环境变量 `API_PORT` 覆盖（默认 8000）：
+Compose 只运行 API 一个常驻服务；宿主端口由环境变量 `API_PORT` 覆盖（默认 8000），
+API 工作进程数由 `API_WORKERS` 覆盖（默认 1）：
 
 ```bash
 API_PORT=9000 docker compose up --build api
 # 服务监听在宿主的 9000 端口
+
+API_WORKERS=2 docker compose up --build api
+# 以两个 API 工作进程启动，共享同一个 SQLite 持久化卷
 ```
+
+判重、版本检查与写入的原子性不依赖工作进程数：多个工作进程各自持有指向同一
+SQLite 文件的连接，全部判重与状态读取都在 `BEGIN IMMEDIATE` 写事务内完成，
+由数据库唯一约束兜底。因此无论请求落到哪个进程，同一 `commandId` 的并发重放都
+只有一次成功插入，其余原子重放首次成功的响应字节；争用同一版本的命令也只有一个
+成功。提交以 WAL 落盘，容器重建后从持久化卷完整恢复审核快照与命令判重记录，
+重放与 `409 COMMAND_ID_REUSED` 语义保持不变。
 
 一次性验收服务 `verify`：等待 API 健康后，先跑完整 pytest 判据，再对运行中的
 API 做 HTTP 级验收（三种结论、排列字节级一致、各类错误代码），随后退出：
